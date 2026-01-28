@@ -1,0 +1,65 @@
+name: Backend CI/CD (Go -> Docker -> ECR -> EC2 ASG)
+
+on:
+  push:
+    branches: ["feature/full-stack"]
+    paths:
+      - "Server/**"
+      - ".github/workflows/backend-ci-cd.yml"
+
+jobs:
+  test_build_push_deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Run unit tests
+        working-directory: Server/MuchToDo
+        run: go test ./... -v
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        working-directory: Server/MuchToDo
+        run: docker build -t backend:latest .
+
+      - name: Tag + Push to ECR (latest)
+        run: |
+          docker tag backend:latest ${{ secrets.ECR_REPO_URL }}:latest
+          docker push ${{ secrets.ECR_REPO_URL }}:latest
+
+      - name: Start ASG rolling instance refresh
+        run: |
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "${{ secrets.ASG_NAME }}" \
+            --preferences MinHealthyPercentage=50,InstanceWarmup=120
+
+      - name: Smoke test (ALB /health)
+        run: |
+          for i in {1..30}; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ secrets.BACKEND_ALB_DNS }}/health" || true)
+            echo "Attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "Backend healthy!"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Smoke test failed"
+          exit 1
+
